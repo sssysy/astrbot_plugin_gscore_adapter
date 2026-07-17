@@ -246,7 +246,8 @@ async def qqofficial_send(
         video_file_source,
         file_source,
         file_name,
-    ) = await QQOfficialMessageEvent._parse_to_qqofficial(chain)  # pyright: ignore[reportPrivateUsage]
+    ) = await QQOfficialMessageEvent._parse_to_qqofficial(chain)
+
     if not (
         plain_text
         or image_base64

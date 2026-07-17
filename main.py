@@ -60,7 +60,7 @@ def _cfg_str_list(config: AstrBotConfig, key: str) -> list[str]:
     PLUGIN_NAME,
     "KimigaiiWuyi",
     "用于链接SayuCore（早柚核心）的适配器！适用于多种游戏功能, 原神、星铁、绝区零、鸣朝、雀魂等游戏的最佳工具箱！",
-    "0.5.0",
+    "0.5.1",
 )
 class GsCoreAdapter(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -112,7 +112,8 @@ class GsCoreAdapter(Star):
         return any(raw_text.startswith(prefix) for prefix in self.GSCORE_ONLY_PREFIXES)
 
     async def _convert_image(self, image_msg: Image) -> GsMessage | None:
-        img_path = getattr(image_msg, "path", None) or getattr(image_msg, "url", None)
+        logger.debug(f"[GsCore] 转换图片消息: {image_msg}")
+        img_path = getattr(image_msg, "url", None) or getattr(image_msg, "path", None)
         if not img_path:
             logger.warning(f"[GsCore] 图片消息缺少路径: {image_msg}")
             return None
