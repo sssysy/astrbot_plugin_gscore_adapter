@@ -27,6 +27,7 @@ from astrbot.core.message.components import (
     Nodes,
     Plain,
     Record,
+    Reply,
     Video,
 )
 from astrbot.core.platform.platform import Platform
@@ -132,6 +133,8 @@ async def gs_to_components(
             message.append(File(file_name, str(path)))
         elif _c.type == "at":
             message.append(At(qq=_c.data))
+        elif _c.type in {"reply", "reply_id"}:
+            message.append(Reply(id=str(_c.data)))
         elif _c.type == "excute_ban_user":
             await execute_ban_user(platform, _c.data)
         else:

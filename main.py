@@ -19,7 +19,16 @@ import aiofiles
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, StarTools, register
-from astrbot.core.message.components import At, File, Image, Plain, Reply
+from astrbot.core.message.components import (
+    At,
+    File,
+    Forward,
+    Image,
+    Node,
+    Nodes,
+    Plain,
+    Reply,
+)
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
@@ -29,6 +38,8 @@ from .models import Message as GsMessage
 from .models import MessageReceive
 
 PLUGIN_NAME = "astrbot_plugin_gscore_adapter"
+_NODE_MARK = "[合并转发]"
+_NODE_MAX_DEPTH = 3
 
 
 def _cfg_str(config: AstrBotConfig, key: str, default: str) -> str:
@@ -60,7 +71,7 @@ def _cfg_str_list(config: AstrBotConfig, key: str) -> list[str]:
     PLUGIN_NAME,
     "KimigaiiWuyi",
     "用于链接SayuCore（早柚核心）的适配器！适用于多种游戏功能, 原神、星铁、绝区零、鸣朝、雀魂等游戏的最佳工具箱！",
-    "0.5.2",
+    "0.5.5",
 )
 class GsCoreAdapter(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -134,8 +145,214 @@ class GsCoreAdapter(Star):
         base64_data = b64encode(img_data).decode("utf-8")
         return GsMessage(type="image", data=f"base64://{base64_data}")
 
+    def _reply_text(self, reply: Reply) -> str:
+        """引用正文：优先平台解析好的纯文本，否则拼 chain 里的 Plain."""
+        if reply.message_str:
+            return str(reply.message_str)
+        if reply.text:
+            return str(reply.text)
+        parts: list[str] = []
+        for item in reply.chain or []:
+            if isinstance(item, Plain):
+                parts.append(item.text)
+        return "".join(parts)
+
+    def _node_preview(self, items: list[GsMessage]) -> str:
+        lines: list[str] = [_NODE_MARK]
+        for item in items:
+            if item.type == "text" and item.data is not None:
+                text = str(item.data).strip()
+                if text:
+                    lines.append(text)
+            elif item.type == "image":
+                lines.append("[图片]")
+            elif item.type == "record":
+                lines.append("[语音]")
+            elif item.type == "video":
+                lines.append("[视频]")
+            elif item.type == "file":
+                lines.append("[文件]")
+        return "\n".join(lines)
+
+    async def _parse_ob_forward(
+        self,
+        raw: object,
+        event: AstrMessageEvent,
+        depth: int,
+        seen: set[str],
+    ) -> list[GsMessage]:
+        messages: object
+        if isinstance(raw, dict) and "messages" in raw:
+            messages = raw["messages"]
+        else:
+            messages = raw
+        if not isinstance(messages, list):
+            return [GsMessage(type="text", data=_NODE_MARK)]
+
+        items: list[GsMessage] = []
+        for entry in messages:
+            if not isinstance(entry, dict):
+                continue
+            payload = entry
+            if (
+                "type" in entry
+                and entry["type"] == "node"
+                and "data" in entry
+                and isinstance(entry["data"], dict)
+            ):
+                payload = entry["data"]
+
+            nickname = ""
+            if "sender" in payload and isinstance(payload["sender"], dict):
+                sender = payload["sender"]
+                if "nickname" in sender and sender["nickname"]:
+                    nickname = str(sender["nickname"])
+            elif "name" in payload and payload["name"]:
+                nickname = str(payload["name"])
+            if nickname:
+                items.append(GsMessage(type="text", data=f"{nickname}:"))
+
+            content: object = None
+            if "content" in payload:
+                content = payload["content"]
+            elif "message" in payload:
+                content = payload["message"]
+            if isinstance(content, str) and content:
+                items.append(GsMessage(type="text", data=content))
+            elif isinstance(content, list):
+                items.extend(
+                    await self._ob_dict_segs_to_gs(content, event, depth, seen)
+                )
+        return items if items else [GsMessage(type="text", data=_NODE_MARK)]
+
+    def _forward_id_from_dict(self, data: dict[str, object]) -> str:
+        if "id" in data and data["id"] is not None:
+            return str(data["id"])
+        if "message_id" in data and data["message_id"] is not None:
+            return str(data["message_id"])
+        return ""
+
+    async def _ob_dict_segs_to_gs(
+        self,
+        segs: list[object],
+        event: AstrMessageEvent,
+        depth: int,
+        seen: set[str],
+    ) -> list[GsMessage]:
+        items: list[GsMessage] = []
+        for seg in segs:
+            if not isinstance(seg, dict):
+                continue
+            typ = str(seg["type"]) if "type" in seg and seg["type"] is not None else ""
+            data = seg["data"] if "data" in seg and isinstance(seg["data"], dict) else {}
+            if typ == "text" and "text" in data:
+                items.append(GsMessage(type="text", data=str(data["text"])))
+            elif typ == "image":
+                url = data["url"] if "url" in data else (data["file"] if "file" in data else "")
+                if url:
+                    items.append(GsMessage(type="image", data=str(url)))
+            elif typ == "at" and "qq" in data:
+                items.append(GsMessage(type="at", data=str(data["qq"])))
+            elif typ in {"forward", "forward_msg"}:
+                fid = self._forward_id_from_dict(data)
+                if fid:
+                    items.append(GsMessage(type="text", data=_NODE_MARK))
+                    items.extend(
+                        await self._fetch_forward_items(event, fid, depth + 1, seen)
+                    )
+                else:
+                    items.append(GsMessage(type="text", data=_NODE_MARK))
+        return items
+
+    async def _fetch_forward_items(
+        self,
+        event: AstrMessageEvent,
+        forward_id: str,
+        depth: int = 0,
+        seen: set[str] | None = None,
+    ) -> list[GsMessage]:
+        visited = seen if seen is not None else set()
+        if not forward_id or forward_id in visited or depth >= _NODE_MAX_DEPTH:
+            return [GsMessage(type="text", data=_NODE_MARK)]
+        visited.add(forward_id)
+        platform_id = event.get_platform_id()
+        platform = self.context.get_platform_inst(platform_id) if platform_id else None
+        if platform is None or event.get_platform_name() != "aiocqhttp":
+            return [GsMessage(type="text", data=_NODE_MARK)]
+        bot = platform.get_client()
+        try:
+            raw = await bot.call_action("get_forward_msg", id=forward_id)
+        except Exception as exc:
+            logger.warning(f"[GsCore] 拉取合并转发失败: {exc}")
+            return [GsMessage(type="text", data=_NODE_MARK)]
+        return await self._parse_ob_forward(raw, event, depth, visited)
+
+    async def _chain_to_node_items(
+        self,
+        chain: list[object],
+        event: AstrMessageEvent,
+        depth: int = 0,
+        seen: set[str] | None = None,
+    ) -> list[GsMessage]:
+        visited = seen if seen is not None else set()
+        items: list[GsMessage] = []
+        for item in chain:
+            if isinstance(item, Forward):
+                items.append(GsMessage(type="text", data=_NODE_MARK))
+                items.extend(
+                    await self._fetch_forward_items(event, str(item.id), depth + 1, visited)
+                )
+                continue
+            if isinstance(item, (Node, Nodes)):
+                items.extend(
+                    await self._flatten_nodes(item, event, depth + 1, visited)
+                )
+                continue
+            items.extend(await self._build_single_content(item, event, from_reply=True))
+        return items
+
+    async def _flatten_nodes(
+        self,
+        msg: Node | Nodes,
+        event: AstrMessageEvent,
+        depth: int,
+        seen: set[str],
+    ) -> list[GsMessage]:
+        if depth >= _NODE_MAX_DEPTH:
+            return [GsMessage(type="text", data=_NODE_MARK)]
+        items: list[GsMessage] = [GsMessage(type="text", data=_NODE_MARK)]
+        nodes = msg.nodes if isinstance(msg, Nodes) else [msg]
+        for node in nodes:
+            if node.name:
+                items.append(GsMessage(type="text", data=f"{node.name}:"))
+            items.extend(
+                await self._chain_to_node_items(node.content or [], event, depth, seen)
+            )
+        return items
+
+    async def _forward_to_node(
+        self, msg: Forward, event: AstrMessageEvent
+    ) -> GsMessage:
+        return GsMessage(
+            type="node",
+            data=await self._fetch_forward_items(event, str(msg.id)),
+        )
+
+    async def _nodes_to_node(
+        self, msg: Node | Nodes, event: AstrMessageEvent
+    ) -> GsMessage:
+        items = await self._flatten_nodes(msg, event, 0, set())
+        return GsMessage(
+            type="node",
+            data=items if items else [GsMessage(type="text", data=_NODE_MARK)],
+        )
+
     async def _build_single_content(
-        self, msg: object, *, from_reply: bool = False
+        self,
+        msg: object,
+        event: AstrMessageEvent,
+        *,
+        from_reply: bool = False,
     ) -> list[GsMessage]:
         """把单个 AstrBot 消息段转换为 core 消息段."""
         if isinstance(msg, Image):
@@ -151,6 +368,10 @@ class GsCoreAdapter(Star):
             return [GsMessage(type="text", data=msg.text)]
         if isinstance(msg, At):
             return [GsMessage(type="at", data=str(msg.qq))]
+        if isinstance(msg, Forward):
+            return [await self._forward_to_node(msg, event)]
+        if isinstance(msg, (Node, Nodes)):
+            return [await self._nodes_to_node(msg, event)]
 
         # 引用消息内经常会带 Json/Face 等 core 不消费的消息段；这些不应阻止
         # 当前消息里的命令文本继续上报。
@@ -161,31 +382,45 @@ class GsCoreAdapter(Star):
     async def _build_content(self, event: AstrMessageEvent) -> list[GsMessage]:
         """把 AstrBot 消息链转换为上报 core 的 GsMessage 列表.
 
-        AstrBot/OneBot 的引用消息通常排在消息链最前面，例如：
-        [Reply(...引用图片...), Plain("ww评分校长")]
-
-        gsuid_core 的命令匹配更依赖当前消息文本。若按原始顺序把 reply/引用图片
-        放在最前面，部分 core 插件会先看到 reply/image 段而错过后面的命令文本。
-        因此这里优先上报“当前消息”的文本/at/图片等内容，再把 reply 段和引用
-        消息里的图片作为上下文附加到末尾。这样 quoted-image + command 可以正常
-        触发，同时仍保留被引用图片给需要取图的插件使用。
+        当前消息的文本/at/图片优先, 引用与合并转发作为上下文附在末尾,
+        避免命令匹配先看到 reply/node。
         """
         current_message: list[GsMessage] = []
         quoted_context: list[GsMessage] = []
 
         for msg in event.get_messages():
             if isinstance(msg, Reply):
-                quoted_context.append(GsMessage(type="reply", data=msg.id))
-                # 引用消息内的图片一并上报，供 core 内插件取图。
-                for reply_msg in getattr(msg, "chain", None) or []:
-                    # 只把 core 常用媒体上下文带过去；忽略 Json/Face 等无关引用段。
+                quoted_context.append(GsMessage(type="reply_id", data=str(msg.id)))
+                reply_text = self._reply_text(msg)
+                quoted_nodes: list[GsMessage] = []
+                for reply_msg in msg.chain or []:
                     if isinstance(reply_msg, Image):
                         quoted_context.extend(
-                            await self._build_single_content(reply_msg, from_reply=True)
+                            await self._build_single_content(
+                                reply_msg, event, from_reply=True
+                            )
                         )
+                    elif isinstance(reply_msg, Forward):
+                        node = await self._forward_to_node(reply_msg, event)
+                        quoted_nodes.append(node)
+                    elif isinstance(reply_msg, (Node, Nodes)):
+                        node = await self._nodes_to_node(reply_msg, event)
+                        quoted_nodes.append(node)
+                if quoted_nodes:
+                    first = quoted_nodes[0]
+                    node_items: list[GsMessage] = []
+                    if isinstance(first.data, list):
+                        for raw in first.data:
+                            if isinstance(raw, GsMessage):
+                                node_items.append(raw)
+                    preview = self._node_preview(node_items) if node_items else _NODE_MARK
+                    if not reply_text or _NODE_MARK not in reply_text:
+                        reply_text = preview if not reply_text else f"{_NODE_MARK}\n{reply_text}"
+                quoted_context.append(GsMessage(type="reply", data=reply_text))
+                quoted_context.extend(quoted_nodes)
                 continue
 
-            current_message.extend(await self._build_single_content(msg))
+            current_message.extend(await self._build_single_content(msg, event))
 
         return current_message + quoted_context
 
