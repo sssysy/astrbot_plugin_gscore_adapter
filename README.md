@@ -18,6 +18,22 @@
   - 示例：`["core", "gs", "sr", "zzz", "ww"]`
   - 当用户消息文本命中这些前缀时，消息仅会发送给 GsCore，并显式调用 `event.stop_event()` 阻断后续 LLM 流程。
 
+### 图片上报与 callback_api_base（v0.5.6）
+
+新版 AstrBot 预处理常把图片 URL 改写为本地路径，而 GsCore 下游插件默认按**网络 URL** 消费图片。本插件上报图片时按以下顺序处理：
+
+1. 消息段自身已是 `http(s)` URL → 直接上报  
+2. 否则注册到 AstrBot 文件服务，生成 `{callback_api_base}/api/file/{token}` 图床链接  
+3. 未配置 `callback_api_base` 或注册失败时，回退为 `base64://`（部分下游插件不支持）
+
+请在 **AstrBot WebUI → 设置** 中配置 `callback_api_base`（对外可达的回调接口地址），例如：
+
+- Core 与 AstrBot 同机：`http://127.0.0.1:6185`（端口以实际 Dashboard 为准）
+- 局域网：`http://<astrbot内网IP>:<Dashboard端口>`
+- 公网/NAT：需反代或真实可达域名
+
+> 注意：文件 token 默认约 300 秒过期且单次有效，请确保 GsCore/下游插件在有效期内拉取图片。
+
 ## v0.5.0 新特性
 
 - ✨ **元事件上报**：监听三种标准元事件 `user_join_group`(进群) / `user_exit_group`(退群) / `poke`(戳一戳)，以 `meta-<事件名>` 单段消息上报 core，可被插件 `@sv.on_meta(...)` 触发器消费，`data` 字段与 NoneBot2 适配器完全一致。目前 AstrBot 仅 aiocqhttp(OneBot V11) 平台会向插件下发此类事件，其余平台待框架支持后可在 `meta_event.py` 中直接扩展。
