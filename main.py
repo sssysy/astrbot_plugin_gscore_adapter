@@ -71,7 +71,7 @@ def _cfg_str_list(config: AstrBotConfig, key: str) -> list[str]:
     PLUGIN_NAME,
     "KimigaiiWuyi",
     "用于链接SayuCore（早柚核心）的适配器！适用于多种游戏功能, 原神、星铁、绝区零、鸣朝、雀魂等游戏的最佳工具箱！",
-    "0.5.5",
+    "0.5.6",
 )
 class GsCoreAdapter(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -123,14 +123,40 @@ class GsCoreAdapter(Star):
         return any(raw_text.startswith(prefix) for prefix in self.GSCORE_ONLY_PREFIXES)
 
     async def _convert_image(self, image_msg: Image) -> GsMessage | None:
+        """图片上报 core: 直连 URL → callback 图床 URL → base64 兜底.
+
+        gscore 下游插件默认按网络 URL 消费图片, 4.26+ 预处理常把 URL
+        改写成本地路径; 优先注册 AstrBot 文件服务(callback_api_base)生成
+        对外可达链接, 避免依赖各平台 raw_message 抠 URL.
+        """
         logger.debug(f"[GsCore] 转换图片消息: {image_msg}")
-        img_path = getattr(image_msg, "url", None) or getattr(image_msg, "path", None)
+
+        # 1. 消息段自身已是网络 URL
+        for attr in ("url", "file"):
+            val = getattr(image_msg, attr, None)
+            if isinstance(val, str) and val.startswith(("http://", "https://")):
+                return GsMessage(type="image", data=val)
+
+        # 2. 本地/base64/file:// → 文件服务图床链接
+        #    需在 AstrBot WebUI 配置「对外可达的回调接口地址」callback_api_base
+        try:
+            public_url = await image_msg.register_to_file_service()
+            logger.debug(f"[GsCore] 图片已注册文件服务: {public_url}")
+            return GsMessage(type="image", data=public_url)
+        except Exception as e:
+            logger.warning(
+                f"[GsCore] 图片无法生成图床链接(请检查 callback_api_base), 回退 base64: {e}"
+            )
+
+        # 3. base64 兜底(未配置 callback 或注册失败)
+        img_path = (
+            getattr(image_msg, "path", None)
+            or getattr(image_msg, "file", None)
+            or getattr(image_msg, "url", None)
+        )
         if not img_path:
             logger.warning(f"[GsCore] 图片消息缺少路径: {image_msg}")
             return None
-
-        if isinstance(img_path, str) and img_path.startswith("http"):
-            return GsMessage(type="image", data=img_path)
 
         file_path = Path(str(img_path))
         if not file_path.exists():
