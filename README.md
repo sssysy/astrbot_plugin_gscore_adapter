@@ -1,4 +1,4 @@
-# ⚙️ astrbot_plugin_gscore_adapter v0.5.6
+# ⚙️ astrbot_plugin_gscore_adapter v0.5.7
 
 > [!IMPORTANT]  
 > 请注意！该插件并不能开箱即用，你还需要完成Core的安装和配置！！
@@ -23,8 +23,10 @@
 新版 AstrBot 预处理常把图片 URL 改写为本地路径，而 GsCore 下游插件默认按**网络 URL** 消费图片。本插件上报图片时按以下顺序处理：
 
 1. 消息段自身已是 `http(s)` URL → 直接上报  
-2. 否则注册到 AstrBot 文件服务，生成 `{callback_api_base}/api/file/{token}` 图床链接  
+2. 否则先将图片**复制到插件缓存目录**（`plugin_data/astrbot_plugin_gscore_adapter/img_cache`），再注册到 AstrBot 文件服务，生成 `{callback_api_base}/api/file/{token}` 图床链接  
 3. 未配置 `callback_api_base` 或注册失败时，回退为 `base64://`（部分下游插件不支持）
+
+> 必须先复制再注册：AstrBot 在单次消息 pipeline 结束时会删除事件级临时图片；若直接注册原路径，GsCore 稍后拉取会得到 404。
 
 请在 **AstrBot WebUI → 设置** 中配置 `callback_api_base`（对外可达的回调接口地址），例如：
 

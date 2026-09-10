@@ -10,6 +10,8 @@
 """
 
 import asyncio
+import hashlib
+import time
 from base64 import b64encode
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -19,6 +21,7 @@ import aiofiles
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core import astrbot_config, file_token_service
 from astrbot.core.message.components import (
     At,
     File,
@@ -40,6 +43,9 @@ from .models import MessageReceive
 PLUGIN_NAME = "astrbot_plugin_gscore_adapter"
 _NODE_MARK = "[合并转发]"
 _NODE_MAX_DEPTH = 3
+# 图片缓存保留时长: 需覆盖 file token 默认 300s 有效期
+_IMG_CACHE_MAX_AGE = 3600
+_IMG_CACHE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
 def _cfg_str(config: AstrBotConfig, key: str, default: str) -> str:
@@ -83,6 +89,9 @@ class GsCoreAdapter(Star):
 
         self.temp_dir: Path = StarTools.get_data_dir(PLUGIN_NAME) / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        # 独立于 AstrBot 事件 temp: pipeline 结束会删事件临时图, 副本须放插件目录
+        self.img_cache_dir: Path = StarTools.get_data_dir(PLUGIN_NAME) / "img_cache"
+        self.img_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.client: GsClient = GsClient(
             context,
@@ -97,6 +106,7 @@ class GsCoreAdapter(Star):
     @override
     async def initialize(self) -> None:
         self._clean_temp_dir()
+        self._prune_img_cache(max_age=0)
         await self.client.start()
 
     @override
@@ -111,6 +121,38 @@ class GsCoreAdapter(Star):
                     f.unlink()
         except OSError as e:
             logger.warning(f"[GsCore] 清理临时目录失败: {e}")
+
+    def _prune_img_cache(self, max_age: float = _IMG_CACHE_MAX_AGE) -> None:
+        """清理过期图片缓存副本(启动时 max_age=0 全量清)."""
+        try:
+            now = time.time()
+            for f in self.img_cache_dir.iterdir():
+                if not f.is_file():
+                    continue
+                if now - f.stat().st_mtime > max_age:
+                    f.unlink()
+        except OSError as e:
+            logger.warning(f"[GsCore] 清理图片缓存失败: {e}")
+
+    async def _cache_image_for_file_service(self, src_path: str) -> str:
+        """把图片复制到插件 img_cache, 供文件服务注册.
+
+        AstrBot pipeline 结束会删除事件级 temp 图; 若直接注册原路径,
+        gscore 稍后拉取会 404. 副本按内容 hash 命名以便去重.
+        """
+        src = Path(src_path)
+        async with aiofiles.open(src, "rb") as f:
+            data = await f.read()
+        digest = hashlib.sha256(data).hexdigest()[:16]
+        suffix = src.suffix.lower()
+        if suffix not in _IMG_CACHE_SUFFIXES:
+            suffix = ".bin"
+        dest = self.img_cache_dir / f"{digest}{suffix}"
+        if not dest.exists():
+            async with aiofiles.open(dest, "wb") as f:
+                await f.write(data)
+        self._prune_img_cache()
+        return str(dest)
 
     def _is_gscore_only_message(self, event: AstrMessageEvent) -> bool:
         if not self.GSCORE_ONLY_PREFIXES:
@@ -137,10 +179,19 @@ class GsCoreAdapter(Star):
             if isinstance(val, str) and val.startswith(("http://", "https://")):
                 return GsMessage(type="image", data=val)
 
-        # 2. 本地/base64/file:// → 文件服务图床链接
+        # 2. 本地/base64/file:// → 复制到插件缓存后注册文件服务图床链接
         #    需在 AstrBot WebUI 配置「对外可达的回调接口地址」callback_api_base
         try:
-            public_url = await image_msg.register_to_file_service()
+            callback_host = str(astrbot_config.get("callback_api_base") or "").rstrip(
+                "/"
+            )
+            if not callback_host:
+                raise RuntimeError("未配置 callback_api_base")
+
+            local_path = await image_msg.convert_to_file_path()
+            cached_path = await self._cache_image_for_file_service(local_path)
+            token = await file_token_service.register_file(cached_path)
+            public_url = f"{callback_host}/api/file/{token}"
             logger.debug(f"[GsCore] 图片已注册文件服务: {public_url}")
             return GsMessage(type="image", data=public_url)
         except Exception as e:
