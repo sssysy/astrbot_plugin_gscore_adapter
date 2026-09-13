@@ -65,6 +65,24 @@ def store_file(path: Path, file: str) -> None:
         _ = f.write(file_content)
 
 
+def extra_group_id_from_content(content: list[GsMessage] | None) -> str:
+    """从 core 下发内容中取出 Message(group) 携带的来源群号."""
+    if not content:
+        return ""
+    for item in content:
+        if item.type == "group" and item.data is not None:
+            return str(item.data)
+    return ""
+
+
+def _to_gs_message(item: Any) -> GsMessage:
+    if isinstance(item, GsMessage):
+        return item
+    if isinstance(item, dict):
+        return GsMessage(type=item.get("type"), data=item.get("data"))
+    return GsMessage()
+
+
 async def gs_to_components(
     gsmsgs: list[GsMessage],
     bot_id: str,
@@ -75,10 +93,14 @@ async def gs_to_components(
 
     image/record/video 均为双形态(base64:// 与 link://), 两种都必须处理;
     node(合并转发)仅 onebot 走原生 Nodes, 其余平台展开逐段发送;
+    image_size 仅供 QQ 官方 bot markdown 使用, 不能当成文本/空转发节点发出;
+    group 是路由段, 不当消息发送;
     excute_ban_user 段为控制语义, 就地执行禁言后不进消息链.
     """
     message: list[BaseMessageComponent] = []
     for _c in gsmsgs:
+        if _c.type in {"image_size", "group"}:
+            continue
         if not _c.data:
             continue
         if _c.type == "text":
@@ -111,19 +133,18 @@ async def gs_to_components(
                 # QQ 平台用原生合并转发, 将多条消息聚合为一个气泡
                 node_message: list[Node] = []
                 for _node in _c.data:
-                    node_message.append(
-                        Node(
-                            await gs_to_components(
-                                [GsMessage(**_node)], bot_id, platform, temp_dir
-                            )
-                        )
+                    comps = await gs_to_components(
+                        [_to_gs_message(_node)], bot_id, platform, temp_dir
                     )
-                message.append(Nodes(node_message))
+                    if comps:
+                        node_message.append(Node(comps))
+                if node_message:
+                    message.append(Nodes(node_message))
             else:
                 for _node in _c.data:
                     message.extend(
                         await gs_to_components(
-                            [GsMessage(**_node)], bot_id, platform, temp_dir
+                            [_to_gs_message(_node)], bot_id, platform, temp_dir
                         )
                     )
         elif _c.type == "file":
@@ -147,6 +168,7 @@ async def aiocqhttp_send(
     chain: MessageChain,
     is_group: bool,
     session_id: str,
+    extra_group_id: str = "",
 ) -> str | list[str] | None:
     """aiocqhttp 平台直发消息并收集平台出站 message_id.
 
@@ -155,14 +177,30 @@ async def aiocqhttp_send(
     上游通用发送路径不返回消息 id, 故此处借用其两个受保护的转换 helper
     以保证消息编码行为完全一致.
     无 id -> None; 单气泡 -> str; 多气泡 -> list[str], 由 core flatten.
+
+    extra_group_id: 群临时私聊的来源群号. SnowLuma 需随 private send_msg
+    携带 group_id; send_private_forward_msg 不接受该参数, 此时改为逐条发送.
     """
     bot = cast("AiocqhttpAdapter", platform).get_client()
     sid = int(session_id)
     ids: list[str] = []
+    temp_group_id = (
+        int(extra_group_id)
+        if (not is_group and extra_group_id.isdigit())
+        else None
+    )
 
     async def _dispatch(messages: list[dict[str, Any]]) -> None:
         if is_group:
             ret = await bot.send_group_msg(group_id=sid, message=messages)
+        elif temp_group_id is not None:
+            ret = await bot.call_action(
+                "send_msg",
+                message_type="private",
+                user_id=sid,
+                group_id=temp_group_id,
+                message=messages,
+            )
         else:
             ret = await bot.send_private_msg(user_id=sid, message=messages)
         if isinstance(ret, dict) and ret.get("message_id") is not None:
@@ -181,6 +219,18 @@ async def aiocqhttp_send(
             if isinstance(seg, (Node, Nodes)):
                 if isinstance(seg, Node):
                     seg = Nodes([seg])
+                # SnowLuma 的 send_private_forward_msg 不接受 group_id
+                if temp_group_id is not None:
+                    for node in seg.nodes:
+                        inner = MessageChain()
+                        inner.chain.extend(node.content or [])
+                        messages = await AiocqhttpMessageEvent._parse_onebot_json(  # pyright: ignore[reportPrivateUsage]
+                            inner
+                        )
+                        if messages:
+                            await _dispatch(messages)
+                            await asyncio.sleep(0.5)
+                    continue
                 payload = await seg.to_dict()
                 if is_group:
                     payload["group_id"] = session_id

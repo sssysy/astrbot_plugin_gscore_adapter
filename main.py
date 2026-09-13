@@ -67,11 +67,35 @@ def _cfg_str_list(config: AstrBotConfig, key: str) -> list[str]:
     return [item for item in val if isinstance(item, str) and item]
 
 
+def _onebot_temp_group_id(event: AstrMessageEvent) -> str:
+    """读取 SnowLuma 群临时私聊携带的来源群号."""
+    if event.get_platform_name() != "aiocqhttp":
+        return ""
+    raw = getattr(event.message_obj, "raw_message", None)
+    if raw is None:
+        return ""
+
+    getter = getattr(raw, "get", None)
+    if not callable(getter):
+        return ""
+    if getter("sub_type") != "group":
+        return ""
+
+    value = getter("group_id")
+    if value is None:
+        sender = getter("sender")
+        if isinstance(sender, dict):
+            value = sender.get("group_id")
+        elif sender is not None:
+            value = getattr(sender, "group_id", None)
+    return str(value) if value is not None else ""
+
+
 @register(
     PLUGIN_NAME,
     "KimigaiiWuyi",
     "用于链接SayuCore（早柚核心）的适配器！适用于多种游戏功能, 原神、星铁、绝区零、鸣朝、雀魂等游戏的最佳工具箱！",
-    "0.5.5",
+    "0.5.6",
 )
 class GsCoreAdapter(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -464,7 +488,11 @@ class GsCoreAdapter(Star):
                 if event.get_message_type() == MessageType.GROUP_MESSAGE
                 else "direct"
             ),
-            group_id=event.get_group_id(),
+            group_id=(
+                event.get_group_id()
+                or _onebot_temp_group_id(event)
+                or None
+            ),
             user_id=user_id,
             sender={"nickname": event.get_sender_name(), "avatar": avatar},
             content=content,

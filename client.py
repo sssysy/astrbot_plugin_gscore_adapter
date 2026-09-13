@@ -25,7 +25,13 @@ from websockets.protocol import State
 
 from .models import Message as GsMessage
 from .models import MessageReceive, MessageSend
-from .send_utils import aiocqhttp_send, del_msg, gs_to_components, qqofficial_send
+from .send_utils import (
+    aiocqhttp_send,
+    del_msg,
+    extra_group_id_from_content,
+    gs_to_components,
+    qqofficial_send,
+)
 
 RECONNECT_INTERVAL = 5  # 秒
 
@@ -229,7 +235,13 @@ class GsClient:
         if platform is not None and platform.meta().name == "aiocqhttp":
             sid = session_id.split("_")[-1] if is_group else session_id
             if sid.isdigit():
-                return await aiocqhttp_send(platform, chain, is_group, sid)
+                return await aiocqhttp_send(
+                    platform,
+                    chain,
+                    is_group,
+                    sid,
+                    extra_group_id=extra_group_id_from_content(msg.content),
+                )
 
         # qq_official 通用发送会丢弃/污染 msg_id 退化为主动消息(无权限);
         # 直发并复用缓存的入站 msg_id 走被动回复, 详见 qqofficial_send
