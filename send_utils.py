@@ -35,9 +35,12 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
 from astrbot.core.star.context import Context
+from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
 
 from .models import Message as GsMessage
 from .models import MessageSend
+
+_FILE_PASSTHROUGH_BOTS = frozenset({"onebot", "onebot_v12"})
 
 if TYPE_CHECKING:
     # 仅类型标注用: 各平台适配器的具体类(get_client()/客户端属性带完整类型)
@@ -65,6 +68,14 @@ def store_file(path: Path, file: str) -> None:
         _ = f.write(file_content)
 
 
+def _existing_local_file(uri: str) -> str | None:
+    """file:// 在 AstrBot 本机存在时返回路径, 否则 None."""
+    path = Path(file_uri_to_path(uri))
+    if path.is_file():
+        return str(path)
+    return None
+
+
 def extra_group_id_from_content(content: list[GsMessage] | None) -> str:
     """从 core 下发内容中取出 Message(group) 携带的来源群号."""
     if not content:
@@ -83,6 +94,74 @@ def _to_gs_message(item: Any) -> GsMessage:
     return GsMessage()
 
 
+def _file_uri_component(
+    data: str,
+    bot_id: str,
+    *,
+    local_factory: type[Image] | type[Record] | type[Video],
+    passthrough_factory: type[Image] | type[Record] | type[Video],
+    kind: str,
+) -> Image | Record | Video | None:
+    local = _existing_local_file(data)
+    if local is not None:
+        return local_factory.fromFileSystem(local)
+    if bot_id in _FILE_PASSTHROUGH_BOTS:
+        return passthrough_factory(file=data)
+    logger.warning(f"[GsCore] 平台 {bot_id} 不支持 file:// {kind}, 已忽略")
+    return None
+
+
+def _image_component(data: str, bot_id: str) -> Image | None:
+    if data.startswith("link://"):
+        return Image.fromURL(data[7:])
+    if is_file_uri(data):
+        seg = _file_uri_component(
+            data,
+            bot_id,
+            local_factory=Image,
+            passthrough_factory=Image,
+            kind="图片",
+        )
+        return seg if isinstance(seg, Image) else None
+    if data.startswith("base64://"):
+        data = data[9:]
+    return Image.fromBase64(data)
+
+
+def _record_component(data: str, bot_id: str) -> Record | None:
+    if data.startswith("link://"):
+        return Record.fromURL(data[7:])
+    if is_file_uri(data):
+        seg = _file_uri_component(
+            data,
+            bot_id,
+            local_factory=Record,
+            passthrough_factory=Record,
+            kind="语音",
+        )
+        return seg if isinstance(seg, Record) else None
+    if data.startswith("base64://"):
+        data = data[9:]
+    return Record.fromBase64(data)
+
+
+def _video_component(data: str, bot_id: str, temp_dir: Path) -> Video | None:
+    if data.startswith("link://"):
+        return Video.fromURL(data[7:])
+    if is_file_uri(data):
+        seg = _file_uri_component(
+            data,
+            bot_id,
+            local_factory=Video,
+            passthrough_factory=Video,
+            kind="视频",
+        )
+        return seg if isinstance(seg, Video) else None
+    path = temp_dir / f"{uuid.uuid4().hex}.mp4"
+    store_file(path, data)
+    return Video.fromFileSystem(str(path))
+
+
 async def gs_to_components(
     gsmsgs: list[GsMessage],
     bot_id: str,
@@ -91,7 +170,7 @@ async def gs_to_components(
 ) -> list[BaseMessageComponent]:
     """把 core 下发的 GsMessage 列表转换为 AstrBot 消息组件列表.
 
-    image/record/video 均为双形态(base64:// 与 link://), 两种都必须处理;
+    image/record/video 为 base64://、link://, 以及 file://(本机路径或协议端 URI);
     node(合并转发)仅 onebot 走原生 Nodes, 其余平台展开逐段发送;
     image_size 仅供 QQ 官方 bot markdown 使用, 不能当成文本/空转发节点发出;
     group 是路由段, 不当消息发送;
@@ -106,28 +185,20 @@ async def gs_to_components(
         if _c.type == "text":
             message.append(Plain(_c.data))
         elif _c.type == "image":
-            if _c.data.startswith("link://"):
-                message.append(Image.fromURL(_c.data[7:]))
-            else:
-                data = _c.data
-                if data.startswith("base64://"):
-                    data = data[9:]
-                message.append(Image.fromBase64(data))
+            data = str(_c.data)
+            img = _image_component(data, bot_id)
+            if img is not None:
+                message.append(img)
         elif _c.type == "record":
-            if _c.data.startswith("link://"):
-                message.append(Record.fromURL(_c.data[7:]))
-            else:
-                data = _c.data
-                if data.startswith("base64://"):
-                    data = data[9:]
-                message.append(Record.fromBase64(data))
+            data = str(_c.data)
+            rec = _record_component(data, bot_id)
+            if rec is not None:
+                message.append(rec)
         elif _c.type == "video":
-            if _c.data.startswith("link://"):
-                message.append(Video.fromURL(_c.data[7:]))
-            else:
-                path = temp_dir / f"{uuid.uuid4().hex}.mp4"
-                store_file(path, _c.data)
-                message.append(Video.fromFileSystem(str(path)))
+            data = str(_c.data)
+            vid = _video_component(data, bot_id, temp_dir)
+            if vid is not None:
+                message.append(vid)
         elif _c.type == "node":
             if bot_id == "onebot":
                 # QQ 平台用原生合并转发, 将多条消息聚合为一个气泡
@@ -161,6 +232,39 @@ async def gs_to_components(
         else:
             logger.warning(f"[GsCore] 不支持的下发消息段类型, 已忽略: {_c.type}")
     return message
+
+
+async def _from_segment_to_onebot(segment: BaseMessageComponent) -> dict[str, Any]:
+    """OneBot 直发: file:// 原样进 data.file, 禁止再转 base64."""
+    if isinstance(segment, (Image, Record)):
+        file_val = segment.file
+        if isinstance(file_val, str) and is_file_uri(file_val):
+            return {
+                "type": segment.type.lower(),
+                "data": {"file": file_val},
+            }
+    if isinstance(segment, Video):
+        file_val = segment.file
+        if isinstance(file_val, str) and is_file_uri(file_val):
+            return {"type": "video", "data": {"file": file_val}}
+    return await AiocqhttpMessageEvent._from_segment_to_dict(  # pyright: ignore[reportPrivateUsage]
+        segment
+    )
+
+
+async def _parse_onebot_json(chain: MessageChain) -> list[dict[str, Any]]:
+    ret: list[dict[str, Any]] = []
+    for segment in chain.chain:
+        if isinstance(segment, At):
+            ret.append(await _from_segment_to_onebot(segment))
+            ret.append({"type": "text", "data": {"text": " "}})
+        elif isinstance(segment, Plain):
+            if not segment.text.strip():
+                continue
+            ret.append(await _from_segment_to_onebot(segment))
+        else:
+            ret.append(await _from_segment_to_onebot(segment))
+    return ret
 
 
 async def aiocqhttp_send(
@@ -209,9 +313,7 @@ async def aiocqhttp_send(
     # 转发消息、文件消息不能和普通消息混在一起发送
     send_one_by_one = any(isinstance(seg, (Node, Nodes, File)) for seg in chain.chain)
     if not send_one_by_one:
-        messages = await AiocqhttpMessageEvent._parse_onebot_json(  # pyright: ignore[reportPrivateUsage]
-            chain
-        )
+        messages = await _parse_onebot_json(chain)
         if messages:
             await _dispatch(messages)
     else:
@@ -224,9 +326,7 @@ async def aiocqhttp_send(
                     for node in seg.nodes:
                         inner = MessageChain()
                         inner.chain.extend(node.content or [])
-                        messages = await AiocqhttpMessageEvent._parse_onebot_json(  # pyright: ignore[reportPrivateUsage]
-                            inner
-                        )
+                        messages = await _parse_onebot_json(inner)
                         if messages:
                             await _dispatch(messages)
                             await asyncio.sleep(0.5)
@@ -247,9 +347,7 @@ async def aiocqhttp_send(
                 )
                 await _dispatch([d])
             else:
-                messages = await AiocqhttpMessageEvent._parse_onebot_json(  # pyright: ignore[reportPrivateUsage]
-                    MessageChain([seg])
-                )
+                messages = await _parse_onebot_json(MessageChain([seg]))
                 if messages:
                     await _dispatch(messages)
                     await asyncio.sleep(0.5)
