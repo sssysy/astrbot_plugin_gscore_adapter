@@ -7,17 +7,21 @@
 - GSCORE_ONLY_PREFIXES 命中时拦截 AstrBot 后续 LLM 流程.
 
 协议侧(连接/下发/回执/控制包)见 client.py 与 send_utils.py.
+图片上报优先走自建图床(可重复读取), 不再依赖官方一次性 file token.
 """
 
 import asyncio
 import hashlib
+import mimetypes
 import time
 from base64 import b64encode
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import override
+from urllib.parse import urlparse, urlunparse
 
 import aiofiles
+from aiohttp import web
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, StarTools, register
@@ -43,7 +47,7 @@ from .models import MessageReceive
 PLUGIN_NAME = "astrbot_plugin_gscore_adapter"
 _NODE_MARK = "[合并转发]"
 _NODE_MAX_DEPTH = 3
-# 图片缓存保留时长: 需覆盖 file token 默认 300s 有效期
+# 图片缓存保留时长: 下游可能多次拉取, 不宜过短
 _IMG_CACHE_MAX_AGE = 3600
 _IMG_CACHE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
@@ -77,7 +81,7 @@ def _cfg_str_list(config: AstrBotConfig, key: str) -> list[str]:
     PLUGIN_NAME,
     "KimigaiiWuyi",
     "用于链接SayuCore（早柚核心）的适配器！适用于多种游戏功能, 原神、星铁、绝区零、鸣朝、雀魂等游戏的最佳工具箱！",
-    "0.5.6",
+    "0.5.8",
 )
 class GsCoreAdapter(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -93,6 +97,12 @@ class GsCoreAdapter(Star):
         self.img_cache_dir: Path = StarTools.get_data_dir(PLUGIN_NAME) / "img_cache"
         self.img_cache_dir.mkdir(parents=True, exist_ok=True)
 
+        self.image_host_port: int = _cfg_int(config, "IMAGE_HOST_PORT", 6186)
+        self._img_app: web.Application | None = None
+        self._img_runner: web.AppRunner | None = None
+        self._img_site: web.TCPSite | None = None
+        self._img_host_ready: bool = False
+
         self.client: GsClient = GsClient(
             context,
             bot_id=_cfg_str(config, "BOT_ID", "AstrBot"),
@@ -106,12 +116,96 @@ class GsCoreAdapter(Star):
     @override
     async def initialize(self) -> None:
         self._clean_temp_dir()
-        self._prune_img_cache(max_age=0)
+        # 不按 0 全量清: 重载后已有 URL 仍可读, 只按 TTL 淘汰
+        self._prune_img_cache()
+        await self._start_image_host()
         await self.client.start()
 
     @override
     async def terminate(self) -> None:
+        await self._stop_image_host()
         await self.client.stop()
+
+    def _image_host_base(self) -> str:
+        """对外可达的图床根地址."""
+        configured = _cfg_str(self.config, "IMAGE_HOST_BASE", "").rstrip("/")
+        if configured:
+            return configured
+        port = self.image_host_port
+        callback = str(astrbot_config.get("callback_api_base") or "").rstrip("/")
+        if callback:
+            parsed = urlparse(callback)
+            host = parsed.hostname or "127.0.0.1"
+            scheme = parsed.scheme or "http"
+            return urlunparse((scheme, f"{host}:{port}", "", "", "", ""))
+        return f"http://127.0.0.1:{port}"
+
+    async def _serve_cached_image(self, request: web.Request) -> web.StreamResponse:
+        name = request.match_info["name"]
+        if not name or "/" in name or "\\" in name or ".." in name:
+            raise web.HTTPNotFound()
+        path = (self.img_cache_dir / name).resolve()
+        try:
+            path.relative_to(self.img_cache_dir.resolve())
+        except ValueError:
+            raise web.HTTPNotFound() from None
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return web.FileResponse(
+            path,
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "Content-Type": media_type,
+            },
+        )
+
+    async def _start_image_host(self) -> None:
+        """启动可重复读取的图片 HTTP 服务.
+
+        官方 /api/file/{token} 为单次有效+300s, 下游多次拉取会 404;
+        自建路由按内容 hash 命名, 缓存存活期内可任意次数 GET.
+        """
+        try:
+            app = web.Application()
+            app.router.add_get("/img/{name}", self._serve_cached_image)
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", self.image_host_port)
+            await site.start()
+        except OSError as e:
+            logger.warning(
+                f"[GsCore] 图床端口 {self.image_host_port} 启动失败({e}), "
+                "上报将回退官方 token/base64"
+            )
+            self._img_host_ready = False
+            return
+        except Exception as e:
+            logger.warning(f"[GsCore] 图床启动失败: {e}")
+            self._img_host_ready = False
+            return
+
+        self._img_app = app
+        self._img_runner = runner
+        self._img_site = site
+        self._img_host_ready = True
+        logger.info(
+            f"[GsCore] 图床已启动: {self._image_host_base()}/img/<hash> "
+            f"(port={self.image_host_port})"
+        )
+
+    async def _stop_image_host(self) -> None:
+        runner = self._img_runner
+        self._img_app = None
+        self._img_runner = None
+        self._img_site = None
+        self._img_host_ready = False
+        if runner is None:
+            return
+        try:
+            await runner.cleanup()
+        except Exception as e:
+            logger.warning(f"[GsCore] 图床关闭异常: {e}")
 
     def _clean_temp_dir(self) -> None:
         """清理上次运行遗留的临时文件(file/video 段发送时落盘)."""
@@ -165,11 +259,10 @@ class GsCoreAdapter(Star):
         return any(raw_text.startswith(prefix) for prefix in self.GSCORE_ONLY_PREFIXES)
 
     async def _convert_image(self, image_msg: Image) -> GsMessage | None:
-        """图片上报 core: 直连 URL → callback 图床 URL → base64 兜底.
+        """图片上报 core: 直连 URL → 自建图床 → 官方 token → base64 兜底.
 
-        gscore 下游插件默认按网络 URL 消费图片, 4.26+ 预处理常把 URL
-        改写成本地路径; 优先注册 AstrBot 文件服务(callback_api_base)生成
-        对外可达链接, 避免依赖各平台 raw_message 抠 URL.
+        gscore 下游插件默认按网络 URL 消费图片, 且可能对同一 URL 多次拉取.
+        官方 file token 单次有效+300s, 不能满足; 优先走自建图床.
         """
         logger.debug(f"[GsCore] 转换图片消息: {image_msg}")
 
@@ -179,29 +272,47 @@ class GsCoreAdapter(Star):
             if isinstance(val, str) and val.startswith(("http://", "https://")):
                 return GsMessage(type="image", data=val)
 
-        # 2. 本地/base64/file:// → 复制到插件缓存后注册文件服务图床链接
-        #    需在 AstrBot WebUI 配置「对外可达的回调接口地址」callback_api_base
+        local_path: str | None = None
         try:
-            callback_host = str(astrbot_config.get("callback_api_base") or "").rstrip(
-                "/"
-            )
-            if not callback_host:
-                raise RuntimeError("未配置 callback_api_base")
-
             local_path = await image_msg.convert_to_file_path()
-            cached_path = await self._cache_image_for_file_service(local_path)
-            token = await file_token_service.register_file(cached_path)
-            public_url = f"{callback_host}/api/file/{token}"
-            logger.debug(f"[GsCore] 图片已注册文件服务: {public_url}")
-            return GsMessage(type="image", data=public_url)
         except Exception as e:
-            logger.warning(
-                f"[GsCore] 图片无法生成图床链接(请检查 callback_api_base), 回退 base64: {e}"
-            )
+            logger.debug(f"[GsCore] convert_to_file_path 失败: {e}")
 
-        # 3. base64 兜底(未配置 callback 或注册失败)
+        # 2. 自建图床(可重复读取)
+        if local_path and self._img_host_ready:
+            try:
+                cached_path = await self._cache_image_for_file_service(local_path)
+                name = Path(cached_path).name
+                public_url = f"{self._image_host_base()}/img/{name}"
+                logger.debug(f"[GsCore] 图片已写入自建图床: {public_url}")
+                return GsMessage(type="image", data=public_url)
+            except Exception as e:
+                logger.warning(f"[GsCore] 自建图床写入失败, 尝试官方 token: {e}")
+
+        # 3. 官方文件服务(单次有效, 兼容旧路径)
+        if local_path:
+            try:
+                callback_host = str(
+                    astrbot_config.get("callback_api_base") or ""
+                ).rstrip("/")
+                if not callback_host:
+                    raise RuntimeError("未配置 callback_api_base")
+
+                cached_path = await self._cache_image_for_file_service(local_path)
+                token = await file_token_service.register_file(cached_path)
+                public_url = f"{callback_host}/api/file/{token}"
+                logger.debug(f"[GsCore] 图片已注册文件服务: {public_url}")
+                return GsMessage(type="image", data=public_url)
+            except Exception as e:
+                logger.warning(
+                    f"[GsCore] 图片无法生成图床链接(请检查图床/callback_api_base), "
+                    f"回退 base64: {e}"
+                )
+
+        # 4. base64 兜底
         img_path = (
-            getattr(image_msg, "path", None)
+            local_path
+            or getattr(image_msg, "path", None)
             or getattr(image_msg, "file", None)
             or getattr(image_msg, "url", None)
         )

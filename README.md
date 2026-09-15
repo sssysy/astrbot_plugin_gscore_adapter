@@ -1,4 +1,4 @@
-# ⚙️ astrbot_plugin_gscore_adapter v0.5.7
+# ⚙️ astrbot_plugin_gscore_adapter v0.5.8
 
 > [!IMPORTANT]  
 > 请注意！该插件并不能开箱即用，你还需要完成Core的安装和配置！！
@@ -18,23 +18,28 @@
   - 示例：`["core", "gs", "sr", "zzz", "ww"]`
   - 当用户消息文本命中这些前缀时，消息仅会发送给 GsCore，并显式调用 `event.stop_event()` 阻断后续 LLM 流程。
 
-### 图片上报与 callback_api_base（v0.5.6）
+### 图片上报与自建图床（v0.5.8）
 
-新版 AstrBot 预处理常把图片 URL 改写为本地路径，而 GsCore 下游插件默认按**网络 URL** 消费图片。本插件上报图片时按以下顺序处理：
+新版 AstrBot 预处理常把图片 URL 改写为本地路径，而 GsCore 下游插件默认按**网络 URL** 消费图片，且可能对同一 URL **多次拉取**。官方 `/api/file/{token}` 为**单次有效 + 300 秒**，不够用。
+
+本插件上报图片时按以下顺序处理：
 
 1. 消息段自身已是 `http(s)` URL → 直接上报  
-2. 否则先将图片**复制到插件缓存目录**（`plugin_data/astrbot_plugin_gscore_adapter/img_cache`），再注册到 AstrBot 文件服务，生成 `{callback_api_base}/api/file/{token}` 图床链接  
-3. 未配置 `callback_api_base` 或注册失败时，回退为 `base64://`（部分下游插件不支持）
+2. **自建图床**：复制到 `plugin_data/astrbot_plugin_gscore_adapter/img_cache`（按内容 hash 去重），由插件内置 HTTP 服务提供  
+   `http://<IMAGE_HOST_BASE>/img/<hash>.<ext>`，缓存存活期内可任意次数 GET  
+3. 图床未启动时，回退 AstrBot 官方文件服务（单次 token）  
+4. 仍失败则回退 `base64://`
 
-> 必须先复制再注册：AstrBot 在单次消息 pipeline 结束时会删除事件级临时图片；若直接注册原路径，GsCore 稍后拉取会得到 404。
+相关配置：
 
-请在 **AstrBot WebUI → 设置** 中配置 `callback_api_base`（对外可达的回调接口地址），例如：
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `IMAGE_HOST_PORT` | `6186` | 自建图床监听端口 |
+| `IMAGE_HOST_BASE` | 空 | 对外可达根地址；留空则用 `callback_api_base` 的主机 + 图床端口自动推断 |
 
-- Core 与 AstrBot 同机：`http://127.0.0.1:6185`（端口以实际 Dashboard 为准）
-- 局域网：`http://<astrbot内网IP>:<Dashboard端口>`
-- 公网/NAT：需反代或真实可达域名
+请保证 GsCore 所在机器能访问该地址。同机 host 网络部署时一般为 `http://127.0.0.1:6186` 或 `http://<内网IP>:6186`。
 
-> 注意：文件 token 默认约 300 秒过期且单次有效，请确保 GsCore/下游插件在有效期内拉取图片。
+> 仍建议配置 `callback_api_base`：图床地址自动推断会用到它的主机名。
 
 ## v0.5.0 新特性
 
