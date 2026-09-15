@@ -34,5 +34,17 @@
         "type": "int",
         "hint": "默认30次，-1为无限重试",
         "default": 30
+    },
+    "IMAGE_HOST_PORT": {
+        "description": "自建图片HTTP服务端口(可重复读取)",
+        "type": "int",
+        "hint": "默认6186。下游可对同一URL多次GET，不受官方token单次限制",
+        "default": 6186
+    },
+    "IMAGE_HOST_BASE": {
+        "description": "自建图床对外可达根地址(留空自动推断)",
+        "type": "string",
+        "hint": "例如 http://192.168.31.2:6186 。留空则用callback_api_base主机+图床端口",
+        "default": ""
     }
 }
