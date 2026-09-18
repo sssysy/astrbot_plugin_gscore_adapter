@@ -285,7 +285,7 @@ class GsCoreAdapter(Star):
     async def _convert_file(self, file_msg: File) -> GsMessage | None:
         """把 File 转为 core 的 file 段 (name|value)"""
         logger.debug(f"[GsCore] 转换文件消息: {file_msg}")
-        name = str(file_msg.name or "file").replace("\\", "/").split("/")[-1] or "file"
+        name = str(file_msg.name or "file")
 
         url = getattr(file_msg, "url", None)
         if isinstance(url, str) and url.startswith("http"):
@@ -296,16 +296,12 @@ class GsCoreAdapter(Star):
             if isinstance(val, str) and val.startswith("base64://"):
                 return GsMessage(type="file", data=f"{name}|{val}")
 
-        file_path = getattr(file_msg, "file_", None) or None
+        file_path = getattr(file_msg, "file_", None)
         if not file_path:
-            if isinstance(url, str) and url:
-                return GsMessage(type="file", data=f"{name}|{url}")
             logger.warning(f"[GsCore] 文件消息缺少路径: {file_msg}")
             return None
 
         path = Path(str(file_path))
-        if not path.exists():
-            path = Path(__file__).parent / str(file_path)
         if not path.exists():
             logger.warning(f"[GsCore] 文件不存在: {file_path}")
             return None
